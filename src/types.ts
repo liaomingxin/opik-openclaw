@@ -74,6 +74,8 @@ export type ActiveTrace = {
   llmSpan: Span | null;
   toolSpans: Map<string, Span>;
   subagentSpans: Map<string, Span>;
+  /** How many LLM turns (llm_input events) this trace has seen. */
+  llmTurnCount: number;
   startedAt: number;
   lastActivityAt: number;
   /** Cost metadata accumulated from model.usage diagnostic events. */
