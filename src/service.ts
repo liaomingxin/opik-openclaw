@@ -486,8 +486,6 @@ export function createOpikService(
         tags,
         projectName,
         rememberSessionCorrelation,
-        closeActiveTrace,
-        forgetSessionCorrelation,
         applyContextMeta,
         safeSpanUpdate,
         safeSpanEnd,

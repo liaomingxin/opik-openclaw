@@ -611,20 +611,220 @@ describe("opik service", () => {
       expect(mockTraceFn).toHaveBeenCalledWith(expect.objectContaining({ tags: undefined }));
     });
 
-    test("closes existing trace for same sessionKey before creating new one", async () => {
+    test("reuses existing trace for same sessionKey instead of creating a new one", async () => {
       const { api, hooks } = createApi();
-      const firstTrace = opikState.createMockTrace();
-      const secondTrace = opikState.createMockTrace();
-      mockTraceFn.mockReturnValueOnce(firstTrace).mockReturnValueOnce(secondTrace);
+      const mockLlmSpan1 = opikState.createMockSpan();
+      const mockLlmSpan2 = opikState.createMockSpan();
+      const mockTrace = opikState.createMockTrace();
+      mockTrace.span.mockReturnValueOnce(mockLlmSpan1).mockReturnValueOnce(mockLlmSpan2);
+      mockTraceFn.mockReturnValue(mockTrace);
 
       const service = createOpikService(api as any);
       await service.start(createServiceContext() as any);
 
       invokeHook(hooks, "llm_input", { model: "m1", provider: "p", prompt: "" }, agentCtx("s1"));
+      invokeHook(
+        hooks,
+        "llm_output",
+        { model: "m1", provider: "p", assistantTexts: ["A"], usage: { input: 10 } },
+        agentCtx("s1"),
+      );
       invokeHook(hooks, "llm_input", { model: "m2", provider: "p", prompt: "" }, agentCtx("s1"));
 
-      expect(firstTrace.end).toHaveBeenCalled();
-      expect(mockTraceFn).toHaveBeenCalledTimes(2);
+      // Only ONE trace created — not replaced
+      expect(mockTraceFn).toHaveBeenCalledTimes(1);
+      // First trace NOT ended
+      expect(mockTrace.end).not.toHaveBeenCalled();
+      // Two LLM spans created on the same trace
+      expect(mockTrace.span).toHaveBeenCalledTimes(2);
+      // Second span uses turn count in name
+      expect(mockTrace.span).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ name: "m2 #2", type: "llm" }),
+      );
+    });
+
+    test("closes prior LLM span on reuse when llm_output did not fire", async () => {
+      const { api, hooks } = createApi();
+      const mockLlmSpan1 = opikState.createMockSpan();
+      const mockLlmSpan2 = opikState.createMockSpan();
+      const mockTrace = opikState.createMockTrace();
+      mockTrace.span.mockReturnValueOnce(mockLlmSpan1).mockReturnValueOnce(mockLlmSpan2);
+      mockTraceFn.mockReturnValue(mockTrace);
+
+      const service = createOpikService(api as any);
+      await service.start(createServiceContext() as any);
+
+      invokeHook(hooks, "llm_input", { model: "m1", provider: "p", prompt: "" }, agentCtx("s1"));
+      // No llm_output — span still open
+      invokeHook(hooks, "llm_input", { model: "m2", provider: "p", prompt: "" }, agentCtx("s1"));
+
+      // Old LLM span defensively closed
+      expect(mockLlmSpan1.end).toHaveBeenCalled();
+      // Only one trace created
+      expect(mockTraceFn).toHaveBeenCalledTimes(1);
+      // New span created on same trace
+      expect(mockTrace.span).toHaveBeenCalledTimes(2);
+    });
+
+    test("accumulates usage across multiple llm_output events", async () => {
+      const { api, hooks } = createApi();
+      const mockLlmSpan1 = opikState.createMockSpan();
+      const mockLlmSpan2 = opikState.createMockSpan();
+      const mockTrace = opikState.createMockTrace();
+      mockTrace.span.mockReturnValueOnce(mockLlmSpan1).mockReturnValueOnce(mockLlmSpan2);
+      mockTraceFn.mockReturnValue(mockTrace);
+
+      const service = createOpikService(api as any);
+      await service.start(createServiceContext() as any);
+
+      // Turn 1
+      invokeHook(
+        hooks,
+        "llm_input",
+        { model: "gpt-4", provider: "openai", prompt: "hi" },
+        agentCtx("s1"),
+      );
+      invokeHook(
+        hooks,
+        "llm_output",
+        {
+          model: "gpt-4",
+          provider: "openai",
+          assistantTexts: ["Hello!"],
+          usage: { input: 100, output: 50, total: 150 },
+        },
+        agentCtx("s1"),
+      );
+
+      // Turn 2
+      invokeHook(
+        hooks,
+        "llm_input",
+        { model: "gpt-4", provider: "openai", prompt: "bye" },
+        agentCtx("s1"),
+      );
+      invokeHook(
+        hooks,
+        "llm_output",
+        {
+          model: "gpt-4",
+          provider: "openai",
+          assistantTexts: ["Goodbye!"],
+          usage: { input: 80, output: 30, total: 110 },
+        },
+        agentCtx("s1"),
+      );
+
+      // agent_end triggers finalization
+      invokeHook(hooks, "agent_end", { success: true, durationMs: 1000 }, agentCtx("s1"));
+      await Promise.resolve();
+
+      // Trace metadata should have SUMMED usage
+      const metadata = mockTrace.update.mock.calls[0][0].metadata;
+      expect(metadata.usage).toEqual({
+        input: 180,
+        output: 80,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 260,
+      });
+    });
+
+    test("multi-turn flow with tool call produces single trace with all spans", async () => {
+      const { api, hooks } = createApi();
+      const mockLlmSpan1 = opikState.createMockSpan();
+      const mockToolSpan = opikState.createMockSpan();
+      const mockLlmSpan2 = opikState.createMockSpan();
+      const mockTrace = opikState.createMockTrace();
+      mockTrace.span
+        .mockReturnValueOnce(mockLlmSpan1) // llm_input #1
+        .mockReturnValueOnce(mockToolSpan) // before_tool_call
+        .mockReturnValueOnce(mockLlmSpan2); // llm_input #2 (reuse)
+      mockTraceFn.mockReturnValue(mockTrace);
+
+      const service = createOpikService(api as any);
+      await service.start(createServiceContext() as any);
+
+      // Turn 1: LLM
+      invokeHook(
+        hooks,
+        "llm_input",
+        { model: "gpt-4", provider: "openai", prompt: "search" },
+        agentCtx("s1"),
+      );
+      invokeHook(
+        hooks,
+        "llm_output",
+        {
+          model: "gpt-4",
+          provider: "openai",
+          assistantTexts: ["Let me search"],
+          usage: { input: 50, output: 20, total: 70 },
+        },
+        agentCtx("s1"),
+      );
+
+      // Tool call
+      invokeHook(
+        hooks,
+        "before_tool_call",
+        { toolName: "web_search", params: { q: "test" } },
+        toolCtx("s1"),
+      );
+      invokeHook(
+        hooks,
+        "after_tool_call",
+        { toolName: "web_search", result: { data: "result" } },
+        toolCtx("s1"),
+      );
+
+      // Turn 2: LLM (reuse)
+      invokeHook(
+        hooks,
+        "llm_input",
+        { model: "gpt-4", provider: "openai", prompt: "summarize" },
+        agentCtx("s1"),
+      );
+      invokeHook(
+        hooks,
+        "llm_output",
+        {
+          model: "gpt-4",
+          provider: "openai",
+          assistantTexts: ["Here is the summary"],
+          lastAssistant: "Here is the summary",
+          usage: { input: 100, output: 60, total: 160 },
+        },
+        agentCtx("s1"),
+      );
+
+      // Agent end
+      invokeHook(hooks, "agent_end", { success: true, durationMs: 2000 }, agentCtx("s1"));
+      await Promise.resolve();
+
+      // Single trace
+      expect(mockTraceFn).toHaveBeenCalledTimes(1);
+      // 3 spans total: 2 LLM + 1 tool
+      expect(mockTrace.span).toHaveBeenCalledTimes(3);
+      // Both LLM spans ended
+      expect(mockLlmSpan1.end).toHaveBeenCalled();
+      expect(mockLlmSpan2.end).toHaveBeenCalled();
+      // Tool span ended
+      expect(mockToolSpan.end).toHaveBeenCalled();
+      // Accumulated usage
+      const metadata = mockTrace.update.mock.calls[0][0].metadata;
+      expect(metadata.usage).toEqual({
+        input: 150,
+        output: 80,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 230,
+      });
+      // Final output from last turn
+      expect(mockTrace.update.mock.calls[0][0].output).toEqual(
+        expect.objectContaining({ output: "Here is the summary" }),
+      );
     });
 
     test("no-ops when sessionKey is missing", async () => {
@@ -2091,7 +2291,7 @@ describe("opik service", () => {
             durationMs: 500,
             model: "gpt-4",
             provider: "openai",
-            usage: { input: 100, output: 50, total: 150 },
+            usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, total: 150 },
           }),
         }),
       );

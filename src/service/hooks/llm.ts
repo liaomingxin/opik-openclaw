@@ -17,8 +17,6 @@ type LlmHooksDeps = {
   tags: string[];
   projectName: string;
   rememberSessionCorrelation: (sessionKey: string, agentId?: unknown) => void;
-  closeActiveTrace: (active: ActiveTrace, reason: string) => void;
-  forgetSessionCorrelation: (sessionKey: string) => void;
   applyContextMeta: (active: ActiveTrace, ctx: Record<string, unknown>) => void;
   safeSpanUpdate: (span: Span, payload: Record<string, unknown>, reason: string) => void;
   safeSpanEnd: (span: Span, reason: string) => void;
@@ -47,11 +45,55 @@ export function registerLlmHooks(deps: LlmHooksDeps): void {
 
     const existing = deps.activeTraces.get(sessionKey);
     if (existing) {
-      deps.closeActiveTrace(existing, `replace active trace sessionKey=${sessionKey}`);
-      deps.activeTraces.delete(sessionKey);
-      deps.forgetSessionCorrelation(sessionKey);
+      // ── REUSE existing trace ──────────────────────────────────────
+      // Defensively close prior LLM span (normally llm_output already closed it).
+      if (existing.llmSpan) {
+        deps.safeSpanEnd(existing.llmSpan, `reuse: close prior llmSpan sessionKey=${sessionKey}`);
+        existing.llmSpan = null;
+      }
+
+      existing.llmTurnCount += 1;
+      existing.lastActivityAt = Date.now();
+      existing.model = event.model;
+      existing.provider = normalizedProvider;
+      deps.applyContextMeta(existing, agentCtxObj);
+
+      // Create a new LLM span under the SAME trace.
+      try {
+        const sanitizedLlmInput = sanitizeValueForOpik({
+          prompt: event.prompt,
+          systemPrompt: event.systemPrompt,
+          historyMessages: event.historyMessages,
+          imagesCount: event.imagesCount,
+        }) as Record<string, unknown>;
+        existing.llmSpan = existing.trace.span({
+          name: `${event.model} #${existing.llmTurnCount}`,
+          type: "llm",
+          model: event.model,
+          provider: normalizedProvider,
+          input: sanitizedLlmInput,
+        });
+      } catch (err) {
+        deps.warn(
+          `opik: llm span creation failed on reuse (sessionKey=${sessionKey}): ${deps.formatError(err)}`,
+        );
+      }
+
+      deps.scheduleMediaAttachmentUploads({
+        entityType: "trace",
+        entity: existing.trace,
+        projectName: deps.projectName,
+        reason: `llm_input reuse sessionKey=${sessionKey}`,
+        payloads: [
+          event.prompt,
+          Array.isArray(event.historyMessages) ? event.historyMessages.at(-1) : undefined,
+        ],
+      });
+
+      return; // Do NOT create a new trace
     }
 
+    // ── NO existing trace — create new (first llm_input for this session) ──
     let trace: Trace;
     try {
       const sanitizedTraceInput = sanitizeValueForOpik({
@@ -105,6 +147,7 @@ export function registerLlmHooks(deps: LlmHooksDeps): void {
       llmSpan,
       toolSpans: new Map(),
       subagentSpans: new Map(),
+      llmTurnCount: 1,
       startedAt: now,
       lastActivityAt: now,
       costMeta: {},
@@ -162,7 +205,13 @@ export function registerLlmHooks(deps: LlmHooksDeps): void {
     };
 
     if (event.usage) {
-      active.usage = { ...active.usage, ...event.usage };
+      active.usage = {
+        input: (active.usage.input ?? 0) + (event.usage.input ?? 0),
+        output: (active.usage.output ?? 0) + (event.usage.output ?? 0),
+        cacheRead: (active.usage.cacheRead ?? 0) + (event.usage.cacheRead ?? 0),
+        cacheWrite: (active.usage.cacheWrite ?? 0) + (event.usage.cacheWrite ?? 0),
+        total: (active.usage.total ?? 0) + (event.usage.total ?? 0),
+      };
     }
     active.model = event.model;
     active.provider = normalizedProvider;
