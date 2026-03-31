@@ -16,15 +16,26 @@ const plugin = {
   register(api: OpenClawPluginApi) {
     const pluginConfig = parseOpikPluginConfig(api.pluginConfig);
     api.registerService(createOpikService(api, pluginConfig));
-    api.registerCli(
-      ({ program }) =>
-        registerOpikCli({
-          program,
-          loadConfig: api.runtime.config.loadConfig,
-          writeConfigFile: api.runtime.config.writeConfigFile,
-        }),
-      { commands: ["opik"] },
-    );
+    try {
+      if (typeof api.registerCli === "function") {
+        api.registerCli(
+          ({ program }) =>
+            registerOpikCli({
+              program,
+              loadConfig: api.runtime.config.loadConfig,
+              writeConfigFile: api.runtime.config.writeConfigFile,
+            }),
+          { commands: ["opik"] },
+        );
+      }
+    } catch {
+      // registerCli is an undocumented API that may be removed in future
+      // OpenClaw versions. CLI commands (opik configure/status) will be
+      // unavailable, but core tracing functionality is unaffected.
+      console.warn(
+        "opik: failed to register CLI commands; opik configure/status will not be available",
+      );
+    }
   },
 };
 
