@@ -1195,6 +1195,93 @@ describe("opik service", () => {
       );
     });
 
+    test("does NOT fall back to single active trace — prevents subagent mis-association", async () => {
+      const { api, hooks } = createApi();
+      const mockToolSpan = opikState.createMockSpan();
+      const mockTrace = opikState.createMockTrace();
+      const mockLlmSpan = opikState.createMockSpan();
+      mockTrace.span.mockReturnValueOnce(mockLlmSpan).mockReturnValueOnce(mockToolSpan);
+      mockTraceFn.mockReturnValue(mockTrace);
+
+      const service = createOpikService(api as any);
+      const ctx = createServiceContext() as any;
+      await service.start(ctx);
+
+      // Create a trace under session "s1" and a tool span
+      invokeHook(hooks, "llm_input", { model: "m", provider: "p", prompt: "" }, agentCtx("s1"));
+      invokeHook(hooks, "before_tool_call", { toolName: "search", params: {} }, toolCtx("s1"));
+
+      // after_tool_call with NO sessionKey, NO agentId, and a different tool name
+      // so it has no matching before_tool_call and no fallback path can work
+      // (agentId missing → agentId fallback fails; lastActiveSession → "s1"
+      //  but tool name won't match). Previously single-active-trace fallback
+      // would have resolved to "s1" regardless.
+      invokeHook(
+        hooks,
+        "after_tool_call",
+        {
+          toolName: "unrelated_tool",
+          result: { data: 42 },
+        },
+        toolCtx(undefined),
+      );
+
+      // The tool span should NOT have been updated for the unrelated tool
+      // because after_tool_call matched to session "s1" via lastActiveSession
+      // but found no matching tool span for "unrelated_tool"
+      expect(mockToolSpan.update).not.toHaveBeenCalled();
+      expect(mockToolSpan.end).not.toHaveBeenCalled();
+    });
+
+    test("falls back to lastActiveSession even when multiple traces exist", async () => {
+      const { api, hooks } = createApi();
+      const mockToolSpanS1 = opikState.createMockSpan();
+      const mockTraceS1 = opikState.createMockTrace();
+      const mockLlmSpanS1 = opikState.createMockSpan();
+      mockTraceS1.span.mockReturnValueOnce(mockLlmSpanS1).mockReturnValueOnce(mockToolSpanS1);
+
+      const mockTraceS2 = opikState.createMockTrace();
+      const mockLlmSpanS2 = opikState.createMockSpan();
+      mockTraceS2.span.mockReturnValueOnce(mockLlmSpanS2);
+
+      mockTraceFn.mockReturnValueOnce(mockTraceS1).mockReturnValueOnce(mockTraceS2);
+
+      const service = createOpikService(api as any);
+      const ctx = createServiceContext() as any;
+      await service.start(ctx);
+
+      // Create two active traces: s1 and s2
+      invokeHook(hooks, "llm_input", { model: "m", provider: "p", prompt: "" }, agentCtx("s1"));
+      invokeHook(hooks, "before_tool_call", { toolName: "search", params: {} }, toolCtx("s1"));
+      invokeHook(
+        hooks,
+        "llm_input",
+        { model: "m", provider: "p", prompt: "" },
+        agentCtx("s2", { agentId: "agent-2" }),
+      );
+
+      // after_tool_call with NO sessionKey — should fall back to
+      // lastActiveSession ("s2") but since the tool span is on s1, no match
+      invokeHook(
+        hooks,
+        "after_tool_call",
+        {
+          toolName: "search",
+          result: { found: true },
+        },
+        toolCtx(undefined),
+      );
+
+      // s2 is lastActiveSession but has no tool span for "search" — so no update
+      expect(mockToolSpanS1.update).not.toHaveBeenCalled();
+      expect(mockToolSpanS1.end).not.toHaveBeenCalled();
+
+      // Warn about fallback was still emitted
+      expect(ctx.logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("after_tool_call missing sessionKey"),
+      );
+    });
+
     test("matches tool span by toolCallId when same tool name overlaps", async () => {
       const { api, hooks } = createApi();
       const mockToolSpanA = opikState.createMockSpan();

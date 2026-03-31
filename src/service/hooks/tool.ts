@@ -104,7 +104,7 @@ export function registerToolHooks(deps: ToolHooksDeps): void {
     const sessionId = asNonEmptyString(ctxObj.sessionId);
 
     let sessionKey = toolCtx.sessionKey;
-    let fallbackMode: "agentId" | "single active trace" | "last active session" | undefined;
+    let fallbackMode: "agentId" | "last active session" | undefined;
     if (!sessionKey) {
       if (typeof toolCtx.agentId === "string" && toolCtx.agentId.length > 0) {
         const byAgentId = deps.sessionByAgentId.get(toolCtx.agentId);
@@ -113,10 +113,7 @@ export function registerToolHooks(deps: ToolHooksDeps): void {
           fallbackMode = "agentId";
         }
       }
-      if (!sessionKey && deps.activeTraces.size === 1) {
-        sessionKey = deps.activeTraces.keys().next().value as string | undefined;
-        fallbackMode = "single active trace";
-      } else if (!sessionKey) {
+      if (!sessionKey) {
         const lastActiveSessionKey = deps.getLastActiveSessionKey();
         if (lastActiveSessionKey && deps.activeTraces.has(lastActiveSessionKey)) {
           sessionKey = lastActiveSessionKey;
