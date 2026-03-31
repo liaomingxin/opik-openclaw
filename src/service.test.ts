@@ -306,7 +306,7 @@ describe("opik service", () => {
       const service = createOpikService(api as any);
       await service.start(createServiceContext() as any);
 
-      expect(api.on).toHaveBeenCalledTimes(9);
+      expect(api.on).toHaveBeenCalledTimes(10);
       expect(api.on).toHaveBeenCalledWith("llm_input", expect.any(Function));
       expect(api.on).toHaveBeenCalledWith("llm_output", expect.any(Function));
       expect(api.on).toHaveBeenCalledWith("before_tool_call", expect.any(Function));
@@ -317,6 +317,7 @@ describe("opik service", () => {
       expect(api.on).toHaveBeenCalledWith("subagent_ended", expect.any(Function));
       expect(api.on).not.toHaveBeenCalledWith("tool_result_persist", expect.any(Function));
       expect(api.on).toHaveBeenCalledWith("agent_end", expect.any(Function));
+      expect(api.on).toHaveBeenCalledWith("session_end", expect.any(Function));
       expect(diagnosticListeners).toHaveLength(1);
     });
 
@@ -2663,6 +2664,163 @@ describe("opik service", () => {
       mockFlush.mockRejectedValueOnce(new Error("network error"));
 
       await expect(service.stop?.({} as any)).resolves.toBeUndefined();
+    });
+  });
+
+  // =========================================================================
+  // session_end safety net hook
+  // =========================================================================
+  describe("session_end hook", () => {
+    test("is a no-op when agent_end already finalized the trace", async () => {
+      const { api, hooks } = createApi();
+      const mockTrace = opikState.createMockTrace();
+      mockTraceFn.mockReturnValue(mockTrace);
+
+      const service = createOpikService(api as any);
+      await service.start(createServiceContext() as any);
+
+      invokeHook(hooks, "llm_input", { model: "m", provider: "p", prompt: "" }, agentCtx("s1"));
+      invokeHook(hooks, "agent_end", { success: true, durationMs: 100 }, agentCtx("s1"));
+
+      // Let agent_end microtask finalize the trace
+      await Promise.resolve();
+
+      // Reset call counts so we can assert session_end adds no new calls
+      mockTrace.update.mockClear();
+      mockTrace.end.mockClear();
+
+      invokeHook(hooks, "session_end", {}, agentCtx("s1"));
+
+      // No additional trace operations should happen
+      expect(mockTrace.update).not.toHaveBeenCalled();
+      expect(mockTrace.end).not.toHaveBeenCalled();
+    });
+
+    test("finalizes orphaned trace when agent_end was not received", async () => {
+      const { api, hooks } = createApi();
+      const mockTrace = opikState.createMockTrace();
+      mockTraceFn.mockReturnValue(mockTrace);
+
+      const service = createOpikService(api as any);
+      await service.start(createServiceContext() as any);
+
+      invokeHook(hooks, "llm_input", { model: "m", provider: "p", prompt: "" }, agentCtx("s1"));
+
+      // Skip agent_end entirely — go straight to session_end
+      invokeHook(hooks, "session_end", {}, agentCtx("s1"));
+
+      // Trace should be finalized with safety-net error metadata
+      expect(mockTrace.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metadata: expect.objectContaining({
+            success: false,
+            error: "Trace closed by session_end safety net (agent_end was not received)",
+          }),
+          errorInfo: expect.objectContaining({
+            exceptionType: "AgentError",
+            message: "Trace closed by session_end safety net (agent_end was not received)",
+          }),
+        }),
+      );
+
+      expect(mockTrace.end).toHaveBeenCalled();
+      await vi.waitFor(() => expect(mockFlush).toHaveBeenCalled());
+    });
+
+    test("does not double-finalize when racing with agent_end microtask", async () => {
+      const { api, hooks } = createApi();
+      const mockTrace = opikState.createMockTrace();
+      mockTraceFn.mockReturnValue(mockTrace);
+
+      const service = createOpikService(api as any);
+      await service.start(createServiceContext() as any);
+
+      invokeHook(hooks, "llm_input", { model: "m", provider: "p", prompt: "" }, agentCtx("s1"));
+
+      // agent_end fires synchronously (stages agentEnd, queues microtask)
+      invokeHook(hooks, "agent_end", { success: true, durationMs: 100 }, agentCtx("s1"));
+
+      // session_end fires BEFORE the agent_end microtask executes
+      // Since agent_end staged active.agentEnd, session_end should see it and
+      // call finalizeTrace (which deletes from activeTraces).
+      invokeHook(hooks, "session_end", {}, agentCtx("s1"));
+
+      // Now let the agent_end microtask run — it should be a no-op
+      await Promise.resolve();
+
+      // trace.update and trace.end should each be called exactly once
+      expect(mockTrace.update).toHaveBeenCalledTimes(1);
+      expect(mockTrace.end).toHaveBeenCalledTimes(1);
+
+      // The finalization should use the data from agent_end (success: true)
+      expect(mockTrace.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metadata: expect.objectContaining({ success: true }),
+        }),
+      );
+    });
+
+    test("preserves agent_end data when agent_end staged but microtask pending", async () => {
+      const { api, hooks } = createApi();
+      const mockTrace = opikState.createMockTrace();
+      mockTraceFn.mockReturnValue(mockTrace);
+
+      const service = createOpikService(api as any);
+      await service.start(createServiceContext() as any);
+
+      invokeHook(hooks, "llm_input", { model: "m", provider: "p", prompt: "" }, agentCtx("s1"));
+
+      // agent_end fires and stages active.agentEnd with success + error data
+      invokeHook(
+        hooks,
+        "agent_end",
+        { success: false, durationMs: 200, error: "context limit" },
+        agentCtx("s1"),
+      );
+
+      // session_end fires before microtask — should NOT overwrite agentEnd
+      invokeHook(hooks, "session_end", {}, agentCtx("s1"));
+
+      await Promise.resolve();
+
+      // Should use agent_end's error, not the safety-net message
+      expect(mockTrace.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metadata: expect.objectContaining({
+            error: "context limit",
+            success: false,
+          }),
+        }),
+      );
+    });
+
+    test("skips when sessionKey is missing", async () => {
+      const { api, hooks } = createApi();
+      const mockTrace = opikState.createMockTrace();
+      mockTraceFn.mockReturnValue(mockTrace);
+
+      const service = createOpikService(api as any);
+      await service.start(createServiceContext() as any);
+
+      invokeHook(hooks, "llm_input", { model: "m", provider: "p", prompt: "" }, agentCtx("s1"));
+
+      // session_end with no sessionKey
+      invokeHook(hooks, "session_end", {}, { agentId: "agent-1" });
+
+      // Trace should still be in activeTraces — not finalized
+      expect(mockTrace.update).not.toHaveBeenCalled();
+      expect(mockTrace.end).not.toHaveBeenCalled();
+    });
+
+    test("skips when no active trace exists for the session", async () => {
+      const { api, hooks } = createApi();
+      const service = createOpikService(api as any);
+      await service.start(createServiceContext() as any);
+
+      // No llm_input — no active trace
+      invokeHook(hooks, "session_end", {}, agentCtx("s1"));
+
+      expect(mockFlush).not.toHaveBeenCalled();
     });
   });
 });

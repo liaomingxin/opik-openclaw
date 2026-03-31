@@ -605,6 +605,33 @@ export function createOpikService(
       });
 
       // =====================================================================
+      // Hook: session_end — Safety net for orphaned traces
+      // =====================================================================
+      api.on("session_end", (_event, ctx) => {
+        const sessionKey = ctx.sessionKey;
+        if (!sessionKey) return;
+
+        const active = activeTraces.get(sessionKey);
+        if (!active) return; // Already finalized by agent_end — nothing to do.
+
+        // agent_end did not fire (or its microtask hasn't run yet) → finalize now.
+        log.warn(
+          `opik: session_end safety net: finalizing orphaned trace sessionKey=${sessionKey}`,
+        );
+
+        if (!active.agentEnd) {
+          active.agentEnd = {
+            success: false,
+            error: "Trace closed by session_end safety net (agent_end was not received)",
+            durationMs: Date.now() - active.startedAt,
+            messages: [],
+          };
+        }
+
+        finalizeTrace(sessionKey);
+      });
+
+      // =====================================================================
       // Diagnostic event: model.usage — Accumulate cost/context info
       // =====================================================================
       const unsubscribeDiagnostics = onDiagnosticEvent((evt: DiagnosticEventPayload) => {

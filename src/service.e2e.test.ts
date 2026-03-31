@@ -182,6 +182,93 @@ describeMaybe("opik service e2e", () => {
       await service.stop?.({} as any);
     },
   );
+
+  test(
+    "session_end safety net finalizes trace when agent_end is missing",
+    { timeout: 60_000 },
+    async () => {
+      const { api, hooks } = createApi();
+      const logMessages: string[] = [];
+      const service = createOpikService(api as any, { enabled: true });
+
+      await service.start({
+        config: { enabled: true },
+        logger: {
+          info: (msg: string) => logMessages.push(msg),
+          warn: (msg: string) => logMessages.push(msg),
+        },
+        stateDir: "/tmp/opik-e2e-session-end",
+      } as any);
+
+      const sessionKey = `e2e-session-end-${randomUUID()}`;
+      const runId = `run-${randomUUID()}`;
+
+      // 1. Start a trace via llm_input
+      invokeHook(
+        hooks,
+        "llm_input",
+        {
+          model: "gpt-4o-mini",
+          provider: "openai",
+          prompt: "session_end safety net test",
+          systemPrompt: "You are an integration test.",
+          imagesCount: 0,
+          runId,
+          historyMessages: [],
+        },
+        {
+          sessionKey,
+          agentId: "agent-e2e-session-end",
+          messageProvider: "test",
+          runId,
+        },
+      );
+
+      // 2. Send llm_output (provides output data)
+      invokeHook(
+        hooks,
+        "llm_output",
+        {
+          model: "gpt-4o-mini",
+          provider: "openai",
+          assistantTexts: ["Safety net response"],
+          lastAssistant: "Safety net response",
+          usage: { input: 10, output: 5, total: 15 },
+        },
+        {
+          sessionKey,
+          agentId: "agent-e2e-session-end",
+          runId,
+        },
+      );
+
+      // 3. Skip agent_end entirely — go straight to session_end
+      invokeHook(
+        hooks,
+        "session_end",
+        {},
+        {
+          sessionKey,
+          agentId: "agent-e2e-session-end",
+          runId,
+        },
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await service.stop?.({} as any);
+
+      // Verify the safety-net warning was logged
+      const safetyNetLog = logMessages.find((msg) =>
+        msg.includes("session_end safety net"),
+      );
+      if (!safetyNetLog) {
+        throw new Error(
+          "Expected session_end safety net log message but found none. Logs:\n" +
+            logMessages.join("\n"),
+        );
+      }
+    },
+  );
 });
 
 function createApi() {
