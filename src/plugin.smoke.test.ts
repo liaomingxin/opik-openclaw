@@ -59,6 +59,53 @@ describe("plugin smoke", () => {
     expect(manifest.uiHints?.apiKey?.sensitive).toBe(true);
   });
 
+  test("still registers service when registerCli throws", () => {
+    const registerService = vi.fn();
+    const registerCli = vi.fn().mockImplementation(() => {
+      throw new Error("registerCli is not available");
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    plugin.register({
+      pluginConfig: { enabled: true },
+      registerService,
+      registerCli,
+      runtime: {
+        config: {
+          loadConfig: () => ({}),
+          writeConfigFile: async () => undefined,
+        },
+      },
+    } as any);
+
+    expect(registerService).toHaveBeenCalledTimes(1);
+    expect(registerService.mock.calls[0]?.[0]?.id).toBe("opik-openclaw");
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("failed to register CLI commands"),
+    );
+
+    warnSpy.mockRestore();
+  });
+
+  test("still registers service when registerCli is not a function", () => {
+    const registerService = vi.fn();
+
+    plugin.register({
+      pluginConfig: { enabled: true },
+      registerService,
+      // registerCli intentionally omitted
+      runtime: {
+        config: {
+          loadConfig: () => ({}),
+          writeConfigFile: async () => undefined,
+        },
+      },
+    } as any);
+
+    expect(registerService).toHaveBeenCalledTimes(1);
+    expect(registerService.mock.calls[0]?.[0]?.id).toBe("opik-openclaw");
+  });
+
   test("package declares zod runtime dependency for packaged installs", () => {
     const packageJsonPath = new URL("../package.json", import.meta.url);
     const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));

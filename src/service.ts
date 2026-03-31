@@ -19,6 +19,7 @@ import {
   MAX_FLUSH_RETRY_DELAY_MS,
   OPIK_CREATED_FROM,
   OPIK_PLUGIN_ID,
+  SUBAGENT_SPAN_HOSTS_MAX,
 } from "./service/constants.js";
 import {
   asNonEmptyString,
@@ -125,6 +126,20 @@ export function createOpikService(
     active: ActiveTrace,
     span: Span,
   ): void {
+    // Evict oldest entry if at capacity (Map preserves insertion order).
+    if (subagentSpanHosts.size >= SUBAGENT_SPAN_HOSTS_MAX && !subagentSpanHosts.has(sessionKey)) {
+      const oldestKey = subagentSpanHosts.keys().next().value;
+      if (oldestKey !== undefined) {
+        const oldest = subagentSpanHosts.get(oldestKey);
+        if (oldest) {
+          safeSpanEnd(oldest.span, `subagentSpanHosts eviction key=${oldestKey}`);
+        }
+        subagentSpanHosts.delete(oldestKey);
+        log.warn(
+          `opik: subagentSpanHosts at capacity (${SUBAGENT_SPAN_HOSTS_MAX}); evicted oldest entry key=${oldestKey}`,
+        );
+      }
+    }
     subagentSpanHosts.set(sessionKey, { hostSessionKey, active, span });
   }
 

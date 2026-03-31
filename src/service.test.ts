@@ -3110,4 +3110,79 @@ describe("opik service", () => {
       expect(mockFlush).not.toHaveBeenCalled();
     });
   });
+
+  // =========================================================================
+  // subagentSpanHosts eviction
+  // =========================================================================
+  describe("subagentSpanHosts eviction", () => {
+    test("evicts oldest subagent span host when map reaches capacity", async () => {
+      vi.useFakeTimers();
+      const { api, hooks } = createApi();
+      const mockTrace = opikState.createMockTrace();
+      mockTraceFn.mockReturnValue(mockTrace);
+
+      const service = createOpikService(api as any);
+      const ctx = createServiceContext(true, {
+        enabled: true,
+        apiKey: "test-key",
+        staleTraceCleanupEnabled: false,
+      }) as any;
+      await service.start(ctx);
+
+      // Create a parent trace
+      invokeHook(
+        hooks,
+        "llm_input",
+        { model: "m", provider: "p", prompt: "" },
+        agentCtx("parent-session", { agentId: "parent" }),
+      );
+
+      // Track spans created by subagent_spawning
+      const createdSpans: MockSpan[] = [];
+      mockTrace.span.mockImplementation((_opts?: unknown) => {
+        const span = opikState.createMockSpan() as unknown as MockSpan;
+        createdSpans.push(span);
+        return span;
+      });
+
+      // Fill the map to capacity (1000 entries)
+      // SUBAGENT_SPAN_HOSTS_MAX = 1000
+      for (let i = 0; i < 1000; i++) {
+        invokeHook(
+          hooks,
+          "subagent_spawning",
+          { childSessionKey: `child-${i}`, agentId: `agent-${i}`, mode: "run" },
+          { requesterSessionKey: "parent-session", childSessionKey: `child-${i}` },
+        );
+      }
+
+      // The first span (child-0) should NOT be ended yet
+      const firstSpan = createdSpans[0]!;
+      expect(firstSpan.end).not.toHaveBeenCalled();
+      expect(ctx.logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("subagentSpanHosts at capacity"),
+      );
+
+      // Add one more subagent — triggers eviction of the oldest (child-0)
+      invokeHook(
+        hooks,
+        "subagent_spawning",
+        { childSessionKey: "child-overflow", agentId: "agent-overflow", mode: "run" },
+        { requesterSessionKey: "parent-session", childSessionKey: "child-overflow" },
+      );
+
+      // child-0's span should have been ended via eviction
+      expect(firstSpan.end).toHaveBeenCalledTimes(1);
+
+      // A warning should have been logged
+      expect(ctx.logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("subagentSpanHosts at capacity"),
+      );
+      expect(ctx.logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("child-0"),
+      );
+
+      await service.stop?.({} as any);
+    });
+  });
 });
