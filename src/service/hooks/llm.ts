@@ -29,6 +29,7 @@ type LlmHooksDeps = {
   }) => void;
   warn: (message: string) => void;
   formatError: (err: unknown) => string;
+  tryFinalize: (sessionKey: string) => void;
 };
 
 export function registerLlmHooks(deps: LlmHooksDeps): void {
@@ -53,6 +54,7 @@ export function registerLlmHooks(deps: LlmHooksDeps): void {
       }
 
       existing.llmTurnCount += 1;
+      existing.llmOutputReady = false;
       existing.lastActivityAt = Date.now();
       existing.model = event.model;
       existing.provider = normalizedProvider;
@@ -156,6 +158,9 @@ export function registerLlmHooks(deps: LlmHooksDeps): void {
       provider: normalizedProvider,
       channelId,
       trigger,
+      agentEndReady: false,
+      llmOutputReady: false,
+      finalizeTimer: null,
     });
 
     deps.scheduleMediaAttachmentUploads({
@@ -218,5 +223,8 @@ export function registerLlmHooks(deps: LlmHooksDeps): void {
 
     deps.safeSpanEnd(active.llmSpan, `llm_output sessionKey=${sessionKey}`);
     active.llmSpan = null;
+
+    active.llmOutputReady = true;
+    deps.tryFinalize(sessionKey);
   });
 }

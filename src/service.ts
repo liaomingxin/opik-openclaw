@@ -20,6 +20,7 @@ import {
   OPIK_CREATED_FROM,
   OPIK_PLUGIN_ID,
   SUBAGENT_SPAN_HOSTS_MAX,
+  FINALIZE_FALLBACK_TIMEOUT_MS,
 } from "./service/constants.js";
 import {
   asNonEmptyString,
@@ -223,6 +224,10 @@ export function createOpikService(
   }
 
   function closeActiveTrace(active: ActiveTrace, reason: string): void {
+    if (active.finalizeTimer !== null) {
+      clearTimeout(active.finalizeTimer);
+      active.finalizeTimer = null;
+    }
     endChildSpans(active, reason);
     forgetSubagentSpanHostsByActive(active);
 
@@ -376,6 +381,12 @@ export function createOpikService(
     const active = activeTraces.get(sessionKey);
     if (!active) return;
 
+    // Defensively clear any pending fallback timer to prevent double finalization.
+    if (active.finalizeTimer !== null) {
+      clearTimeout(active.finalizeTimer);
+      active.finalizeTimer = null;
+    }
+
     // End any remaining open child spans (LLM span if llm_output didn't fire).
     endChildSpans(active, `finalize sessionKey=${sessionKey}`);
 
@@ -440,6 +451,36 @@ export function createOpikService(
     activeTraces.delete(sessionKey);
     forgetSessionCorrelation(sessionKey);
     scheduleFlush(`trace-finalized sessionKey=${sessionKey}`);
+  }
+
+  /**
+   * Two-phase finalize: only proceeds when both agentEndReady and llmOutputReady
+   * are set, or falls back to a timeout when only agentEndReady is set.
+   */
+  function tryFinalize(sessionKey: string): void {
+    const active = activeTraces.get(sessionKey);
+    if (!active) return;
+
+    if (active.agentEndReady && active.llmOutputReady) {
+      // Both signals received — finalize immediately.
+      if (active.finalizeTimer !== null) {
+        clearTimeout(active.finalizeTimer);
+        active.finalizeTimer = null;
+      }
+      finalizeTrace(sessionKey);
+      return;
+    }
+
+    if (active.agentEndReady && !active.llmOutputReady && active.finalizeTimer === null) {
+      // Only agent_end received — start fallback timer.
+      active.finalizeTimer = setTimeout(() => {
+        active.finalizeTimer = null;
+        const current = activeTraces.get(sessionKey);
+        if (current && current === active) {
+          finalizeTrace(sessionKey);
+        }
+      }, FINALIZE_FALLBACK_TIMEOUT_MS);
+    }
   }
 
   return {
@@ -507,6 +548,7 @@ export function createOpikService(
         scheduleMediaAttachmentUploads: attachmentUploader.scheduleMediaAttachmentUploads,
         warn: (message) => log.warn(message),
         formatError,
+        tryFinalize,
       });
 
       registerToolHooks({
@@ -608,13 +650,9 @@ export function createOpikService(
           ],
         });
 
-        // Defer finalization to a microtask so llm_output (which fires on the
-        // same synchronous call stack) can store output/usage first.
-        const traceRef = active.trace;
-        queueMicrotask(() => {
-          const current = activeTraces.get(sessionKey);
-          if (current && current.trace === traceRef) finalizeTrace(sessionKey);
-        });
+        // Signal agent_end readiness and attempt two-phase finalization.
+        active.agentEndReady = true;
+        tryFinalize(sessionKey);
       });
 
       // =====================================================================
@@ -641,6 +679,10 @@ export function createOpikService(
           };
         }
 
+        if (active.finalizeTimer !== null) {
+          clearTimeout(active.finalizeTimer);
+          active.finalizeTimer = null;
+        }
         finalizeTrace(sessionKey);
       });
 
@@ -686,6 +728,10 @@ export function createOpikService(
             const now = Date.now();
             for (const [key, active] of activeTraces) {
               if (now - active.lastActivityAt > staleTraceTimeoutMs) {
+                if (active.finalizeTimer !== null) {
+                  clearTimeout(active.finalizeTimer);
+                  active.finalizeTimer = null;
+                }
                 endChildSpans(active, `stale cleanup sessionKey=${key}`);
 
                 // Mark trace as stale before closing.

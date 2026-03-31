@@ -117,4 +117,10 @@ export type ActiveTrace = {
     durationMs?: number;
     messages: unknown[];
   };
+  /** Set true when agent_end fires for this trace. */
+  agentEndReady: boolean;
+  /** Set true when llm_output fires (reset on each llm_input reuse). */
+  llmOutputReady: boolean;
+  /** Fallback timer handle; non-null when waiting for llm_output after agent_end. */
+  finalizeTimer: ReturnType<typeof setTimeout> | null;
 };

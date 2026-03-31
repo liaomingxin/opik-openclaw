@@ -717,9 +717,8 @@ describe("opik service", () => {
         agentCtx("s1"),
       );
 
-      // agent_end triggers finalization
+      // agent_end triggers finalization (both signals received — synchronous)
       invokeHook(hooks, "agent_end", { success: true, durationMs: 1000 }, agentCtx("s1"));
-      await Promise.resolve();
 
       // Trace metadata should have SUMMED usage
       const metadata = mockTrace.update.mock.calls[0][0].metadata;
@@ -800,9 +799,8 @@ describe("opik service", () => {
         agentCtx("s1"),
       );
 
-      // Agent end
+      // Agent end (both signals received — synchronous finalize)
       invokeHook(hooks, "agent_end", { success: true, durationMs: 2000 }, agentCtx("s1"));
-      await Promise.resolve();
 
       // Single trace
       expect(mockTraceFn).toHaveBeenCalledTimes(1);
@@ -2097,6 +2095,9 @@ describe("opik service", () => {
         context: { limit: 200000, used: 50000 },
       });
 
+      // Enable fake timers before agent_end so the 100ms fallback timer can be controlled.
+      vi.useFakeTimers();
+
       invokeHook(
         hooks,
         "agent_end",
@@ -2110,8 +2111,9 @@ describe("opik service", () => {
       // Orphaned tool span closed synchronously by agent_end
       expect(mockToolSpan.end).toHaveBeenCalled();
 
-      // Trace finalization is deferred to microtask
-      await Promise.resolve();
+      // No llm_output — finalization deferred to fallback timer
+      vi.advanceTimersByTime(100);
+      vi.useRealTimers();
 
       // Trace should be updated with merged metadata
       expect(mockTrace.update).toHaveBeenCalledWith(
@@ -2139,6 +2141,8 @@ describe("opik service", () => {
       await service.start(createServiceContext() as any);
 
       invokeHook(hooks, "llm_input", { model: "m", provider: "p", prompt: "" }, agentCtx("s1"));
+
+      vi.useFakeTimers();
       invokeHook(
         hooks,
         "agent_end",
@@ -2150,7 +2154,9 @@ describe("opik service", () => {
         agentCtx("s1"),
       );
 
-      await Promise.resolve();
+      // No llm_output — finalization deferred to fallback timer
+      vi.advanceTimersByTime(100);
+      vi.useRealTimers();
 
       expect(mockTrace.update).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -2173,9 +2179,13 @@ describe("opik service", () => {
       await service.start(createServiceContext() as any);
 
       invokeHook(hooks, "llm_input", { model: "m", provider: "p", prompt: "" }, agentCtx("s1"));
+
+      vi.useFakeTimers();
       invokeHook(hooks, "agent_end", { success: true, durationMs: 100 }, agentCtx("s1"));
 
-      await Promise.resolve();
+      // No llm_output — finalization deferred to fallback timer
+      vi.advanceTimersByTime(100);
+      vi.useRealTimers();
 
       const updateCall = mockTrace.update.mock.calls[0][0];
       expect(updateCall.errorInfo).toBeUndefined();
@@ -2213,9 +2223,7 @@ describe("opik service", () => {
 
       invokeHook(hooks, "agent_end", { success: true, durationMs: 500 }, agentCtx("s1"));
 
-      await Promise.resolve();
-
-      // Single consolidated trace.update from finalizeTrace
+      // Two-phase finalize: both signals received — synchronous
       const agentEndCall = mockTrace.update.mock.calls.find(
         (c: unknown[]) => (c[0] as Record<string, unknown>)?.metadata,
       );
@@ -2270,8 +2278,7 @@ describe("opik service", () => {
       );
       invokeHook(hooks, "agent_end", { success: true, durationMs: 500 }, agentCtx("s1"));
 
-      await Promise.resolve();
-
+      // Two-phase finalize: both signals received — synchronous
       const metadata = mockTrace.update.mock.calls[0][0].metadata;
       expect(metadata.provider).toBe("openai");
     });
@@ -2307,8 +2314,7 @@ describe("opik service", () => {
 
       invokeHook(hooks, "agent_end", { success: true, durationMs: 500 }, agentCtx("s1"));
 
-      await Promise.resolve();
-
+      // Two-phase finalize: both signals received — synchronous
       const metadata = mockTrace.update.mock.calls[0][0].metadata as Record<string, unknown>;
       expect(metadata.usage).toEqual(expect.objectContaining({ total: 150 }));
     });
@@ -2331,7 +2337,7 @@ describe("opik service", () => {
   // 6b. Deferred finalization (agent_end + llm_output ordering)
   // =========================================================================
   describe("deferred finalization", () => {
-    test("full flow: llm_input → llm_output → agent_end → microtask produces consolidated trace.update", async () => {
+    test("full flow: llm_input → llm_output → agent_end produces consolidated trace.update synchronously", async () => {
       const { api, hooks } = createApi();
       const mockLlmSpan = opikState.createMockSpan();
       const mockTrace = opikState.createMockTrace();
@@ -2363,13 +2369,7 @@ describe("opik service", () => {
 
       invokeHook(hooks, "agent_end", { success: true, durationMs: 500 }, agentCtx("s1"));
 
-      // Before microtask: trace.update/end not yet called
-      expect(mockTrace.update).not.toHaveBeenCalled();
-      expect(mockTrace.end).not.toHaveBeenCalled();
-
-      await Promise.resolve();
-
-      // After microtask: single consolidated trace.update with both output and metadata
+      // Two-phase finalize: both signals received — finalize synchronously
       expect(mockTrace.update).toHaveBeenCalledTimes(1);
       expect(mockTrace.update).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -2384,7 +2384,7 @@ describe("opik service", () => {
         }),
       );
       expect(mockTrace.end).toHaveBeenCalledTimes(1);
-      await vi.waitFor(() => expect(mockFlush).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(mockFlush).toHaveBeenCalled());
     });
 
     test("agent_end without llm_output extracts output from messages", async () => {
@@ -2405,6 +2405,7 @@ describe("opik service", () => {
       );
 
       // No llm_output — agent_end fires with messages
+      vi.useFakeTimers();
       invokeHook(
         hooks,
         "agent_end",
@@ -2419,7 +2420,9 @@ describe("opik service", () => {
         agentCtx("s1"),
       );
 
-      await Promise.resolve();
+      // No llm_output — finalization deferred to fallback timer
+      vi.advanceTimersByTime(100);
+      vi.useRealTimers();
 
       // Output should be extracted from last assistant message
       expect(mockTrace.update).toHaveBeenCalledWith(
@@ -2460,9 +2463,12 @@ describe("opik service", () => {
       });
 
       // No llm_output — go straight to agent_end
+      vi.useFakeTimers();
       invokeHook(hooks, "agent_end", { success: true, durationMs: 400 }, agentCtx("s1"));
 
-      await Promise.resolve();
+      // No llm_output — finalization deferred to fallback timer
+      vi.advanceTimersByTime(100);
+      vi.useRealTimers();
 
       const metadata = mockTrace.update.mock.calls[0][0].metadata;
       // Usage should fall back to costMeta values since llm_output never fired
@@ -2476,7 +2482,7 @@ describe("opik service", () => {
       expect(metadata.costUsd).toBe(0.02);
     });
 
-    test("agent_end does not call trace.update or trace.end synchronously", async () => {
+    test("agent_end without llm_output does not finalize synchronously, defers to 100ms fallback", async () => {
       const { api, hooks } = createApi();
       const mockTrace = opikState.createMockTrace();
       mockTraceFn.mockReturnValue(mockTrace);
@@ -2484,16 +2490,18 @@ describe("opik service", () => {
       const service = createOpikService(api as any);
       await service.start(createServiceContext() as any);
 
+      vi.useFakeTimers();
       invokeHook(hooks, "llm_input", { model: "m", provider: "p", prompt: "" }, agentCtx("s1"));
       invokeHook(hooks, "agent_end", { success: true, durationMs: 100 }, agentCtx("s1"));
 
-      // Synchronously: no trace.update or trace.end yet
+      // Synchronously: no trace.update or trace.end yet (fallback timer pending)
       expect(mockTrace.update).not.toHaveBeenCalled();
       expect(mockTrace.end).not.toHaveBeenCalled();
 
-      await Promise.resolve();
+      // After fallback timer: finalization happened
+      vi.advanceTimersByTime(100);
+      vi.useRealTimers();
 
-      // After microtask: finalization happened
       expect(mockTrace.update).toHaveBeenCalled();
       expect(mockTrace.end).toHaveBeenCalled();
     });
@@ -2544,8 +2552,7 @@ describe("opik service", () => {
         agentCtx("s1"),
       );
 
-      await Promise.resolve();
-
+      // Two-phase finalize: both signals received (llm_output set llmOutputReady) — synchronous
       // llm_output path wins: output is "" (joined empty array), lastAssistant is undefined
       expect(mockTrace.update).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -2556,6 +2563,275 @@ describe("opik service", () => {
           }),
         }),
       );
+    });
+
+    test("reverse order: agent_end before llm_output finalizes when llm_output arrives", async () => {
+      vi.useFakeTimers();
+
+      const { api, hooks } = createApi();
+      const mockLlmSpan = opikState.createMockSpan();
+      const mockTrace = opikState.createMockTrace();
+      mockTrace.span.mockReturnValue(mockLlmSpan);
+      mockTraceFn.mockReturnValue(mockTrace);
+
+      const service = createOpikService(api as any);
+      await service.start(createServiceContext() as any);
+
+      invokeHook(
+        hooks,
+        "llm_input",
+        { model: "gpt-4", provider: "openai", prompt: "hi" },
+        agentCtx("s1"),
+      );
+
+      // agent_end fires FIRST (no llm_output yet) — starts 100ms fallback timer
+      invokeHook(hooks, "agent_end", { success: true, durationMs: 500 }, agentCtx("s1"));
+
+      // Not yet finalized
+      expect(mockTrace.update).not.toHaveBeenCalled();
+      expect(mockTrace.end).not.toHaveBeenCalled();
+
+      // llm_output arrives within 100ms — both signals present → immediate finalize
+      invokeHook(
+        hooks,
+        "llm_output",
+        {
+          model: "gpt-4",
+          provider: "openai",
+          assistantTexts: ["Hello!"],
+          lastAssistant: "Hello!",
+          usage: { input: 100, output: 50, total: 150 },
+        },
+        agentCtx("s1"),
+      );
+
+      // Finalized synchronously by llm_output's tryFinalize call
+      expect(mockTrace.update).toHaveBeenCalledTimes(1);
+      expect(mockTrace.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          output: { output: "Hello!", lastAssistant: "Hello!" },
+          metadata: expect.objectContaining({
+            success: true,
+            usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, total: 150 },
+          }),
+        }),
+      );
+      expect(mockTrace.end).toHaveBeenCalledTimes(1);
+
+      // Advance past 100ms — no double finalize (timer was cleared)
+      vi.advanceTimersByTime(200);
+      expect(mockTrace.update).toHaveBeenCalledTimes(1);
+      expect(mockTrace.end).toHaveBeenCalledTimes(1);
+    });
+
+    test("missing llm_output: agent_end triggers 100ms fallback finalization", async () => {
+      vi.useFakeTimers();
+
+      const { api, hooks } = createApi();
+      const mockTrace = opikState.createMockTrace();
+      mockTraceFn.mockReturnValue(mockTrace);
+
+      const service = createOpikService(api as any);
+      await service.start(createServiceContext() as any);
+
+      invokeHook(hooks, "llm_input", { model: "m", provider: "p", prompt: "" }, agentCtx("s1"));
+      invokeHook(hooks, "agent_end", { success: true, durationMs: 100 }, agentCtx("s1"));
+
+      // At t=0: not finalized
+      expect(mockTrace.update).not.toHaveBeenCalled();
+
+      // At t=99ms: still not finalized
+      vi.advanceTimersByTime(99);
+      expect(mockTrace.update).not.toHaveBeenCalled();
+
+      // At t=100ms: fallback timer fires → finalize
+      vi.advanceTimersByTime(1);
+      expect(mockTrace.update).toHaveBeenCalledTimes(1);
+      expect(mockTrace.end).toHaveBeenCalledTimes(1);
+    });
+
+    test("no double-finalize: fallback timer + both-ready race", async () => {
+      vi.useFakeTimers();
+
+      const { api, hooks } = createApi();
+      const mockLlmSpan = opikState.createMockSpan();
+      const mockTrace = opikState.createMockTrace();
+      mockTrace.span.mockReturnValue(mockLlmSpan);
+      mockTraceFn.mockReturnValue(mockTrace);
+
+      const service = createOpikService(api as any);
+      await service.start(createServiceContext() as any);
+
+      invokeHook(
+        hooks,
+        "llm_input",
+        { model: "gpt-4", provider: "openai", prompt: "hi" },
+        agentCtx("s1"),
+      );
+
+      // agent_end starts 100ms timer
+      invokeHook(hooks, "agent_end", { success: true, durationMs: 500 }, agentCtx("s1"));
+
+      // Advance 50ms — timer hasn't fired yet
+      vi.advanceTimersByTime(50);
+      expect(mockTrace.update).not.toHaveBeenCalled();
+
+      // llm_output arrives — both ready → immediate finalize, clears timer
+      invokeHook(
+        hooks,
+        "llm_output",
+        {
+          model: "gpt-4",
+          provider: "openai",
+          assistantTexts: ["Hello!"],
+          usage: { input: 100, output: 50, total: 150 },
+        },
+        agentCtx("s1"),
+      );
+
+      expect(mockTrace.update).toHaveBeenCalledTimes(1);
+      expect(mockTrace.end).toHaveBeenCalledTimes(1);
+
+      // Advance past original timer — no double finalize
+      vi.advanceTimersByTime(50);
+      expect(mockTrace.update).toHaveBeenCalledTimes(1);
+      expect(mockTrace.end).toHaveBeenCalledTimes(1);
+    });
+
+    test("multi-turn: llm_input reuse resets llmOutputReady", async () => {
+      vi.useFakeTimers();
+
+      const { api, hooks } = createApi();
+      const mockLlmSpan1 = opikState.createMockSpan();
+      const mockLlmSpan2 = opikState.createMockSpan();
+      const mockTrace = opikState.createMockTrace();
+      mockTrace.span.mockReturnValueOnce(mockLlmSpan1).mockReturnValueOnce(mockLlmSpan2);
+      mockTraceFn.mockReturnValue(mockTrace);
+
+      const service = createOpikService(api as any);
+      await service.start(createServiceContext() as any);
+
+      // Turn 1
+      invokeHook(
+        hooks,
+        "llm_input",
+        { model: "gpt-4", provider: "openai", prompt: "hi" },
+        agentCtx("s1"),
+      );
+      invokeHook(
+        hooks,
+        "llm_output",
+        {
+          model: "gpt-4",
+          provider: "openai",
+          assistantTexts: ["Hello!"],
+          usage: { input: 100, output: 50, total: 150 },
+        },
+        agentCtx("s1"),
+      );
+
+      // Turn 2 (reuse) — resets llmOutputReady to false
+      invokeHook(
+        hooks,
+        "llm_input",
+        { model: "gpt-4", provider: "openai", prompt: "follow up" },
+        agentCtx("s1"),
+      );
+
+      // agent_end fires — but llmOutputReady is false (reset by turn 2's llm_input)
+      // → starts 100ms fallback timer instead of immediate finalize
+      invokeHook(hooks, "agent_end", { success: true, durationMs: 1000 }, agentCtx("s1"));
+      expect(mockTrace.update).not.toHaveBeenCalled();
+
+      // Turn 2's llm_output arrives — both signals now present → immediate finalize
+      invokeHook(
+        hooks,
+        "llm_output",
+        {
+          model: "gpt-4",
+          provider: "openai",
+          assistantTexts: ["Sure!"],
+          usage: { input: 200, output: 80, total: 280 },
+        },
+        agentCtx("s1"),
+      );
+
+      expect(mockTrace.update).toHaveBeenCalledTimes(1);
+      // Usage should be accumulated from both turns
+      const metadata = mockTrace.update.mock.calls[0][0].metadata as Record<string, unknown>;
+      expect(metadata.usage).toEqual({
+        input: 300,
+        output: 130,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 430,
+      });
+
+      // Timer should have been cleared — no double finalize
+      vi.advanceTimersByTime(200);
+      expect(mockTrace.update).toHaveBeenCalledTimes(1);
+    });
+
+    test("stop() clears all pending finalize timers", async () => {
+      vi.useFakeTimers();
+
+      const { api, hooks } = createApi();
+      const mockTrace1 = opikState.createMockTrace();
+      const mockTrace2 = opikState.createMockTrace();
+      mockTraceFn.mockReturnValueOnce(mockTrace1).mockReturnValueOnce(mockTrace2);
+
+      const service = createOpikService(api as any);
+      await service.start(createServiceContext() as any);
+
+      // Create two traces with pending fallback timers (no llm_output)
+      invokeHook(hooks, "llm_input", { model: "m", provider: "p", prompt: "" }, agentCtx("s1"));
+      invokeHook(hooks, "llm_input", { model: "m", provider: "p", prompt: "" }, agentCtx("s2"));
+      invokeHook(hooks, "agent_end", { success: true, durationMs: 10 }, agentCtx("s1"));
+      invokeHook(hooks, "agent_end", { success: true, durationMs: 10 }, agentCtx("s2"));
+
+      // Both timers pending — not yet finalized via tryFinalize
+      expect(mockTrace1.update).not.toHaveBeenCalled();
+      expect(mockTrace2.update).not.toHaveBeenCalled();
+
+      // stop() should clear timers and close traces via closeActiveTrace
+      await service.stop?.({} as any);
+
+      // Traces ended by closeActiveTrace (not by tryFinalize/finalizeTrace)
+      expect(mockTrace1.end).toHaveBeenCalledTimes(1);
+      expect(mockTrace2.end).toHaveBeenCalledTimes(1);
+
+      // Advance past timer period — no additional finalization
+      vi.advanceTimersByTime(200);
+      expect(mockTrace1.end).toHaveBeenCalledTimes(1);
+      expect(mockTrace2.end).toHaveBeenCalledTimes(1);
+    });
+
+    test("session_end clears pending finalize timer before finalizing", async () => {
+      vi.useFakeTimers();
+
+      const { api, hooks } = createApi();
+      const mockTrace = opikState.createMockTrace();
+      mockTraceFn.mockReturnValue(mockTrace);
+
+      const service = createOpikService(api as any);
+      await service.start(createServiceContext() as any);
+
+      invokeHook(hooks, "llm_input", { model: "m", provider: "p", prompt: "" }, agentCtx("s1"));
+
+      // agent_end starts 100ms fallback timer (no llm_output)
+      invokeHook(hooks, "agent_end", { success: true, durationMs: 100 }, agentCtx("s1"));
+      expect(mockTrace.update).not.toHaveBeenCalled();
+
+      // session_end fires before timer expires — clears timer and finalizes
+      invokeHook(hooks, "session_end", {}, agentCtx("s1"));
+
+      expect(mockTrace.update).toHaveBeenCalledTimes(1);
+      expect(mockTrace.end).toHaveBeenCalledTimes(1);
+
+      // Timer would have fired at +100ms — but should be a no-op (already finalized)
+      vi.advanceTimersByTime(200);
+      expect(mockTrace.update).toHaveBeenCalledTimes(1);
+      expect(mockTrace.end).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -2588,9 +2864,12 @@ describe("opik service", () => {
       });
 
       // Now end the agent to inspect the merged metadata
+      vi.useFakeTimers();
       invokeHook(hooks, "agent_end", { success: true, durationMs: 10 }, agentCtx("s1"));
 
-      await Promise.resolve();
+      // No llm_output — finalization deferred to fallback timer
+      vi.advanceTimersByTime(100);
+      vi.useRealTimers();
 
       expect(mockTrace.update).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -2624,9 +2903,12 @@ describe("opik service", () => {
         context: { limit: 200000, used: 60000 },
       });
 
+      vi.useFakeTimers();
       invokeHook(hooks, "agent_end", { success: true, durationMs: 2000 }, agentCtx("s1"));
 
-      await Promise.resolve();
+      // No llm_output — finalization deferred to fallback timer
+      vi.advanceTimersByTime(100);
+      vi.useRealTimers();
 
       const agentEndCall = mockTrace.update.mock.calls.find(
         (c: unknown[]) =>
@@ -2673,8 +2955,12 @@ describe("opik service", () => {
         provider: "openai-codex",
       });
 
+      vi.useFakeTimers();
       invokeHook(hooks, "agent_end", { success: true, durationMs: 10 }, agentCtx("s1"));
-      await Promise.resolve();
+
+      // No llm_output — finalization deferred to fallback timer
+      vi.advanceTimersByTime(100);
+      vi.useRealTimers();
 
       const metadata = mockTrace.update.mock.calls[0][0].metadata;
       expect(metadata.provider).toBe("openai");
@@ -2696,9 +2982,12 @@ describe("opik service", () => {
         channel: "telegram",
       });
 
+      vi.useFakeTimers();
       invokeHook(hooks, "agent_end", { success: true, durationMs: 10 }, agentCtx("s1"));
 
-      await Promise.resolve();
+      // No llm_output — finalization deferred to fallback timer
+      vi.advanceTimersByTime(100);
+      vi.useRealTimers();
 
       // costMeta should be empty (no model.usage was dispatched)
       const metadata = mockTrace.update.mock.calls[0][0].metadata;
@@ -2934,7 +3223,8 @@ describe("opik service", () => {
       invokeHook(hooks, "llm_input", { model: "m", provider: "p", prompt: "" }, agentCtx("s1"));
       invokeHook(hooks, "agent_end", { success: true, durationMs: 10 }, agentCtx("s1"));
 
-      await Promise.resolve();
+      // No llm_output — finalization deferred to 100ms fallback timer
+      vi.advanceTimersByTime(100);
       await vi.waitFor(() => expect(mockFlush).toHaveBeenCalledTimes(1));
 
       vi.advanceTimersByTime(10);
@@ -2966,11 +3256,13 @@ describe("opik service", () => {
       const service = createOpikService(api as any);
       await service.start(createServiceContext() as any);
 
+      vi.useFakeTimers();
       invokeHook(hooks, "llm_input", { model: "m", provider: "p", prompt: "" }, agentCtx("s1"));
       invokeHook(hooks, "agent_end", { success: true, durationMs: 100 }, agentCtx("s1"));
 
-      // Let agent_end microtask finalize the trace
-      await Promise.resolve();
+      // No llm_output — let fallback timer finalize the trace
+      vi.advanceTimersByTime(100);
+      vi.useRealTimers();
 
       // Reset call counts so we can assert session_end adds no new calls
       mockTrace.update.mockClear();
@@ -3014,7 +3306,9 @@ describe("opik service", () => {
       await vi.waitFor(() => expect(mockFlush).toHaveBeenCalled());
     });
 
-    test("does not double-finalize when racing with agent_end microtask", async () => {
+    test("does not double-finalize when racing with agent_end fallback timer", async () => {
+      vi.useFakeTimers();
+
       const { api, hooks } = createApi();
       const mockTrace = opikState.createMockTrace();
       mockTraceFn.mockReturnValue(mockTrace);
@@ -3024,16 +3318,15 @@ describe("opik service", () => {
 
       invokeHook(hooks, "llm_input", { model: "m", provider: "p", prompt: "" }, agentCtx("s1"));
 
-      // agent_end fires synchronously (stages agentEnd, queues microtask)
+      // agent_end fires (stages agentEnd, starts 100ms fallback timer)
       invokeHook(hooks, "agent_end", { success: true, durationMs: 100 }, agentCtx("s1"));
 
-      // session_end fires BEFORE the agent_end microtask executes
-      // Since agent_end staged active.agentEnd, session_end should see it and
-      // call finalizeTrace (which deletes from activeTraces).
+      // session_end fires BEFORE the fallback timer expires —
+      // clears the timer and calls finalizeTrace (which deletes from activeTraces).
       invokeHook(hooks, "session_end", {}, agentCtx("s1"));
 
-      // Now let the agent_end microtask run — it should be a no-op
-      await Promise.resolve();
+      // Now let the fallback timer period pass — it should be a no-op (timer was cleared)
+      vi.advanceTimersByTime(100);
 
       // trace.update and trace.end should each be called exactly once
       expect(mockTrace.update).toHaveBeenCalledTimes(1);
@@ -3045,9 +3338,11 @@ describe("opik service", () => {
           metadata: expect.objectContaining({ success: true }),
         }),
       );
+
+      vi.useRealTimers();
     });
 
-    test("preserves agent_end data when agent_end staged but microtask pending", async () => {
+    test("preserves agent_end data when agent_end staged but fallback timer pending", async () => {
       const { api, hooks } = createApi();
       const mockTrace = opikState.createMockTrace();
       mockTraceFn.mockReturnValue(mockTrace);
@@ -3065,10 +3360,8 @@ describe("opik service", () => {
         agentCtx("s1"),
       );
 
-      // session_end fires before microtask — should NOT overwrite agentEnd
+      // session_end fires before fallback timer — should NOT overwrite agentEnd
       invokeHook(hooks, "session_end", {}, agentCtx("s1"));
-
-      await Promise.resolve();
 
       // Should use agent_end's error, not the safety-net message
       expect(mockTrace.update).toHaveBeenCalledWith(
